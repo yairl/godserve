@@ -64,6 +64,11 @@ def create_app(db_path: str, blob_root: str) -> FastAPI:
                     dispatcher._publish_terminal(
                         jid, "failed", None, None, row["error"]
                     )
+                # A lease-expired job frees the slot on a still-connected worker
+                # (it no longer runs there); drop the ghost so poke can re-dispatch.
+                conn = registry.find_by_job(jid)
+                if conn is not None:
+                    conn.running.discard(jid)
             # Requeued jobs can be picked up by idle workers immediately.
             await dispatcher.poke()
 

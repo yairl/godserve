@@ -13,6 +13,7 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 import signal
 import tempfile
 from pathlib import Path
@@ -20,6 +21,7 @@ from pathlib import Path
 from ...models import BlobRef, JobBundle
 from ..content import download, materialize
 from ..envs.venv import VenvProvider
+from ..session import SessionManager
 from .base import JobIO, JobOutcome
 
 log = logging.getLogger(__name__)
@@ -30,13 +32,27 @@ class LocalBackend:
         self._provider = provider
         self._scratch_root = Path(scratch_root)
         self._scratch_root.mkdir(parents=True, exist_ok=True)
+        shim_dir = self._materialize_shim(self._scratch_root.parent)
+        # Persistent (per-backend = per-agent) so sessions survive run() calls.
+        self._sessions = SessionManager(provider, str(self._scratch_root), shim_dir)
+
+    @staticmethod
+    def _materialize_shim(work_root: Path) -> str:
+        """Copy serve_shim.py into a PYTHONPATH shim dir as ``godserve/__init__.py``
+        so serve-mode venvs can ``from godserve import serve`` without godserve
+        installed (§4.2). The shim is stdlib-only, so the standalone copy works."""
+        shim_pkg = work_root / "shim" / "godserve"
+        shim_pkg.mkdir(parents=True, exist_ok=True)
+        src = Path(__file__).resolve().parent.parent / "serve_shim.py"
+        shutil.copyfile(src, shim_pkg / "__init__.py")
+        return str(work_root / "shim")
+
+    def live_sessions(self) -> list[str]:
+        return self._sessions.live_sessions()
 
     async def run(self, bundle: JobBundle, io: JobIO) -> JobOutcome:
-        if bundle.spec.run.mode != "once":
-            return JobOutcome(
-                status="failed",
-                error="serve mode not supported until Phase 2",
-            )
+        if bundle.spec.run.mode == "serve":
+            return await self._sessions.run_job(bundle, io)
 
         env_key = bundle.spec.env_key
         try:

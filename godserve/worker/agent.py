@@ -93,11 +93,16 @@ class Agent:
 
         self._provider = VenvProvider(str(self._work_root))
         self._backend = _make_backend(self._provider, str(self._work_root / "scratch"))
+        # Defensive: import-path backends may not implement live_sessions().
+        self._live_sessions = getattr(self._backend, "live_sessions", lambda: [])
 
         self._ws: websockets.WebSocketClientProtocol | None = None
         self._send_lock = asyncio.Lock()
         self._slots: dict[str, asyncio.Task] = {}
         self._emits: set[asyncio.Task] = set()
+        # Emit tasks grouped by job_id so the terminal boundary can flush a
+        # job's outstanding partials/logs before its Result (see _run_job).
+        self._job_emits: dict[str, set[asyncio.Task]] = {}
         self._stopping = asyncio.Event()
         self._drain = False
 
@@ -132,7 +137,7 @@ class Agent:
             tier=self._tier,
             max_slots=self._max_slots,
             warm_envs=self.warm_envs(),
-            live_sessions=[],
+            live_sessions=self._live_sessions(),
         ))
         await self._send_ready()
         hb = asyncio.create_task(self._heartbeat_loop())
@@ -180,37 +185,61 @@ class Agent:
             log.error("backend error for job %s: %s", bundle.job_id, exc, exc_info=True)
             outcome = JobOutcome(status="failed", error=str(exc))
 
-        await self._send(Result(
-            job_id=bundle.job_id,
-            status=outcome.status,
-            exit_code=outcome.exit_code,
-            result=outcome.result,
-            error=outcome.error,
-        ))
+        if outcome.requeue:
+            # Session crash mid-job: suppress the terminal Result so the lease
+            # lapses and the coordinator's sweeper requeues (ARCH §4.2). All job
+            # state transitions still flow through claim/finish/requeue_expired.
+            log.warning("job %s session crashed; leaving to lease requeue", bundle.job_id)
+            self._job_emits.pop(bundle.job_id, None)
+        else:
+            # Terminal boundary: flush this job's outstanding partial/log sends
+            # so none can land on the coordinator after the Result (which
+            # finalizes the job and closes stream subscribers). Handler-time
+            # emission stays fire-and-forget — only this boundary is ordered.
+            pending = self._job_emits.pop(bundle.job_id, None)
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            await self._send(Result(
+                job_id=bundle.job_id,
+                status=outcome.status,
+                exit_code=outcome.exit_code,
+                result=outcome.result,
+                error=outcome.error,
+            ))
         self._slots.pop(bundle.job_id, None)
         if not self._drain:
             await self._send_ready()
 
     def _emit_log(self, job_id: str, stream: str, data: str) -> None:
         # Fire-and-forget: scheduling a send must never block the handler.
-        self._spawn_emit(self._send(Output(job_id=job_id, stream=stream, data=data)))
+        self._spawn_emit(job_id, self._send(Output(job_id=job_id, stream=stream, data=data)))
 
     def _emit_partial(self, job_id: str, data: str) -> None:
-        self._spawn_emit(self._send(Partial(job_id=job_id, data=data)))
+        self._spawn_emit(job_id, self._send(Partial(job_id=job_id, data=data)))
 
-    def _spawn_emit(self, coro) -> None:
+    def _spawn_emit(self, job_id: str, coro) -> None:
         # Retain a strong ref so the loop can't GC the task mid-flight and
-        # silently drop the send; discard on completion.
+        # silently drop the send; discard on completion. Also group by job_id so
+        # the terminal boundary in _run_job can await this job's sends.
         task = asyncio.create_task(coro)
         self._emits.add(task)
-        task.add_done_callback(self._emits.discard)
+        group = self._job_emits.setdefault(job_id, set())
+        group.add(task)
+
+        def _done(t: asyncio.Task, jid: str = job_id) -> None:
+            self._emits.discard(t)
+            g = self._job_emits.get(jid)
+            if g is not None:
+                g.discard(t)
+
+        task.add_done_callback(_done)
 
     async def _send_ready(self) -> None:
         if self.free_slots() > 0:
             await self._send(Ready(
                 slots_free=self.free_slots(),
                 warm_envs=self.warm_envs(),
-                live_sessions=[],
+                live_sessions=self._live_sessions(),
             ))
 
     async def _heartbeat_loop(self) -> None:

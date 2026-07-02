@@ -49,3 +49,13 @@ def test_bad_import_path_raises(tmp_path, monkeypatch):
     provider, scratch = _make(tmp_path)
     with pytest.raises(ValueError):
         _make_backend(provider, scratch)
+
+
+def test_vendor_bareword_is_not_builtin(tmp_path, monkeypatch):
+    # A vendor name like "runpod" is not a core backend: it must be provided as
+    # an import path to user/example code. Backend opacity means core never
+    # special-cases a vendor bareword.
+    monkeypatch.setenv("GODSERVE_BACKEND", "runpod")
+    provider, scratch = _make(tmp_path)
+    with pytest.raises(ValueError):
+        _make_backend(provider, scratch)

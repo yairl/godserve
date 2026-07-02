@@ -14,6 +14,11 @@ class JobOutcome:
     exit_code: int | None = None
     result: dict | None = None
     error: str | None = None
+    # A session crash mid-job is a partial worker failure, not a clean job
+    # failure: the agent suppresses the terminal Result so the lease lapses and
+    # the coordinator's sweeper requeues the job (ARCH §4.2). Never set for a
+    # handler exception (that is a real, terminal failure with the session alive).
+    requeue: bool = False
 
 
 class JobIO:
@@ -42,4 +47,11 @@ class JobIO:
 
 class Backend(Protocol):
     async def run(self, bundle: JobBundle, io: JobIO) -> JobOutcome:
+        ...
+
+    def live_sessions(self) -> list[str]:
+        """session_keys of live (idle+busy) sessions; ``[]`` if none.
+
+        Parallels the env layer's ``warm_keys()`` pull. The agent resolves this
+        defensively so import-path backends without it still work."""
         ...

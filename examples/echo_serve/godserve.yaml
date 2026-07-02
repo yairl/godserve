@@ -1,0 +1,10 @@
+name: echo-serve
+python: "3.13"
+setup: setup.sh
+run:
+  script: run.sh
+  mode: serve
+defaults:
+  timeout_s: 60
+  max_attempts: 2
+  max_tier: null

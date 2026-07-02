@@ -256,7 +256,12 @@ skippable when warm:
 
 For `run.mode == "serve"`, the agent launches `run.sh` **once** inside the env;
 whatever long-lived process it starts becomes the session by speaking a minimal
-IPC protocol on a dedicated pipe (**fd 3**):
+IPC protocol on a dedicated **duplex socket on fd 3**. The agent creates a
+`socket.socketpair()`; the child endpoint is placed on fd 3 via `pass_fds` plus
+a `preexec_fn` that `dup2`s it onto 3 and clears `CLOEXEC` (`pass_fds` alone does
+not land it on a fixed number). The parent endpoint drives a single asyncio
+transport (StreamReader for frames from the child, StreamWriter for jobs to it);
+frames are newline-delimited JSON. stdout/stderr stay separate log pipes:
 
 ```
 session → agent:  READY                       (after init/prep completes)
@@ -285,7 +290,14 @@ upstream as `output`.
   respawn, no re-init, no model reload. Idle timeout ⇒ graceful exit (frees
   GPU). Crash mid-job ⇒ that job requeues; the session respawns on demand.
 - Worker config `max_live_sessions` (default 1 on GPU hosts); at cap, evict an
-  **idle** LRU session first.
+  **idle** LRU session first. Session knobs (all `GODSERVE_`-prefixed):
+  `GODSERVE_MAX_LIVE_SESSIONS` (default 1), `GODSERVE_SESSION_IDLE_S` (idle
+  seconds before graceful shutdown, default 300), `GODSERVE_SESSION_INIT_S`
+  (seconds to await `SessionReady` after spawn, default 300). A live session's
+  env is pinned (acquired for the session's whole lifetime) so it is never
+  LRU-evicted from under a running process; the env is released on session
+  close. With cap 1 on a single-slot worker, "cap reached but all busy" cannot
+  occur, so no waiter exists — this is a config constraint, not a runtime path.
 - `run.mode == "once"` bypasses sessions: `run.sh` executes per job, reads
   `$GODSERVE_INPUTS`, writes JSON to `$GODSERVE_RESULT_PATH` — no SDK needed.
 
