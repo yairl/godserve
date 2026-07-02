@@ -53,11 +53,18 @@ class RunningServer:
         return f"ws://127.0.0.1:{self.port}/v1/worker"
 
 
+@pytest.fixture
+def levels():
+    """Load-handling fill levels for the coordinator. P1/P2 override nothing and
+    get None (no gating); P3 overrides this fixture to inject LevelConfigs."""
+    return None
+
+
 @pytest_asyncio.fixture
-async def server(tmp_path):
+async def server(tmp_path, levels):
     db_path = str(tmp_path / "state.sqlite3")
     blob_root = str(tmp_path / "coord-data")
-    app = create_app(db_path, blob_root)
+    app = create_app(db_path, blob_root, levels)
     srv = RunningServer(app, _free_port())
     await srv.start()
     try:

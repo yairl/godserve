@@ -227,16 +227,17 @@ class DB:
         await self._c.commit()
         return cur.rowcount == 1
 
-    async def requeue_expired(self, now: float) -> list[str]:
+    async def requeue_expired(self, now: float) -> list[tuple[str, int | None]]:
         """Expire stale leases. Under max_attempts → requeue (attempt++);
-        else → failed. Returns the affected job_ids."""
+        else → failed. Returns ``(job_id, claimed_tier)`` per affected job — the
+        tier is read before the UPDATE nulls it so budgets can be refunded."""
         cur = await self._c.execute(
-            """SELECT id, attempt, max_attempts FROM jobs
+            """SELECT id, attempt, max_attempts, claimed_tier FROM jobs
                WHERE state IN ('assigned', 'running') AND lease_expires < ?""",
             (now,),
         )
         rows = await cur.fetchall()
-        affected: list[str] = []
+        affected: list[tuple[str, int | None]] = []
         for row in rows:
             job_id = row["id"]
             if row["attempt"] + 1 < row["max_attempts"]:
@@ -255,10 +256,20 @@ class DB:
                        WHERE id=?""",
                     (now, job_id),
                 )
-            affected.append(job_id)
+            affected.append((job_id, row["claimed_tier"]))
         if affected:
             await self._c.commit()
         return affected
+
+    async def inflight_by_tier(self) -> dict[int, int]:
+        """Count assigned/running jobs per claiming tier (the honest cost unit)."""
+        cur = await self._c.execute(
+            """SELECT claimed_tier, COUNT(*) AS n FROM jobs
+               WHERE state IN ('assigned', 'running') AND claimed_tier IS NOT NULL
+               GROUP BY claimed_tier"""
+        )
+        rows = await cur.fetchall()
+        return {row["claimed_tier"]: row["n"] for row in rows}
 
     async def queued_depth(self) -> int:
         cur = await self._c.execute(
@@ -370,7 +381,7 @@ class DB:
 
     # --- startup recovery -------------------------------------------------
 
-    async def recover_on_startup(self) -> list[str]:
+    async def recover_on_startup(self) -> list[tuple[str, int | None]]:
         """Expire all stale leases → requeue (§5 restart note). Any job left
         assigned/running from a previous process has no live lease holder, so we
         force-expire immediately."""

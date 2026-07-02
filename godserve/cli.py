@@ -92,13 +92,15 @@ def _coordinator(args) -> int:
     import uvicorn
 
     from .coordinator.app import create_app
+    from .models import LevelConfig
 
     cfg = {}
     if args.config and Path(args.config).exists():
         cfg = yaml.safe_load(Path(args.config).read_text()) or {}
     db_path = cfg.get("db_path", args.db or "godserve.sqlite3")
     blob_root = cfg.get("blob_root", args.blob_root or "godserve-data")
-    app = create_app(db_path, blob_root)
+    levels = [LevelConfig(**lvl) for lvl in (cfg.get("levels") or [])]
+    app = create_app(db_path, blob_root, levels)
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
     return 0
 

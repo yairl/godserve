@@ -35,7 +35,11 @@ class WorkerConn:
 
 
 class Registry:
-    def __init__(self, db: DB, on_requeue: Callable[[list[str]], Awaitable[None]] | None = None):
+    def __init__(
+        self,
+        db: DB,
+        on_requeue: Callable[[list[tuple[str, int | None]]], Awaitable[None]] | None = None,
+    ):
         self._db = db
         self._workers: dict[str, WorkerConn] = {}
         self._on_requeue = on_requeue

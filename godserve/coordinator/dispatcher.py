@@ -1,8 +1,11 @@
-"""Dispatch: affinity + atomic claim + lease + result handling (PLAN §1.4).
+"""Dispatch: budget gating + affinity + atomic claim + lease + result handling
+(PLAN §1.4, §3.2).
 
-v1 has no tier gating (Phase 3). On a worker ``ready`` we pick hot > warm > cold
-via ``oldest_queued`` with the ~30s skip window, atomically claim, and send
-``Assign`` or ``NoWork``. On ``Output``/``Partial`` we append a log, publish to
+On a worker ``ready`` we pick hot > warm > cold via ``oldest_queued`` with the
+~30s skip window. Tier 0 is never gated. For tier k>0 we consume one unit of the
+load budget as an admission check *around* the atomic claim; any consumed unit
+that does not become a durable claim (lost race, spec-missing failure) is
+refunded exactly once. On ``Output``/``Partial`` we append a log, publish to
 subscribers, and renew the lease. On ``Result`` we finish the job, spilling an
 oversized result to a blob (§4.6).
 """
@@ -23,6 +26,7 @@ from ..protocol import (
     Result,
 )
 from .blobs import BlobStore
+from .load import LoadController
 from .pubsub import PubSub
 from .queue import Queue
 from .registry import Registry, WorkerConn
@@ -33,12 +37,21 @@ SKIP_WINDOW_S = 30.0
 
 
 class Dispatcher:
-    def __init__(self, db: DB, queue: Queue, pubsub: PubSub, registry: Registry, blobs: BlobStore):
+    def __init__(
+        self,
+        db: DB,
+        queue: Queue,
+        pubsub: PubSub,
+        registry: Registry,
+        blobs: BlobStore,
+        load: LoadController,
+    ):
         self._db = db
         self._queue = queue
         self._pubsub = pubsub
         self._registry = registry
         self._blobs = blobs
+        self._load = load
 
     async def on_ready(self, conn: WorkerConn) -> None:
         """Pick a job for this ready worker and assign it, else mark idle.
@@ -59,6 +72,14 @@ class Dispatcher:
             await conn.send(NoWork())
             return
 
+        # Tier 0 is never gated (§2.2, the rescue path). Tier k>0 is admitted
+        # only while its load budget has a free unit; consume it *around* the
+        # atomic claim, refunding any unit that never becomes a durable claim.
+        consumed = conn.tier > 0
+        if consumed and not self._load.try_consume(conn.tier):
+            await conn.send(NoWork())
+            return
+
         job_id = row["id"]
         claimed = await self._db.claim_job(
             job_id, conn.worker_id, conn.tier, row["lease_ttl_s"]
@@ -66,6 +87,8 @@ class Dispatcher:
         if not claimed:
             # Lost the race (another tier/worker took it). Slot stays idle; the
             # next poke/ready retries.
+            if consumed:
+                self._load.refund(conn.tier)
             await conn.send(NoWork())
             return
 
@@ -74,6 +97,8 @@ class Dispatcher:
             log.error("job %s references missing spec %s", job_id, row["spec_id"])
             await self._db.finish_job(job_id, "failed", None, "spec not found")
             self._publish_terminal(job_id, "failed", None, None, "spec not found")
+            if consumed:
+                self._load.refund(conn.tier)
             await conn.send(NoWork())
             return
 

@@ -317,15 +317,15 @@ Run a tier-1 worker whose backend targets a **simulated remote** — e.g.
 
 ### Phase 3 acceptance (from §10-P3)
 
-- [ ] Hold depth ≥ `depth₁` for `sustain_s` → tier 1 starts claiming, never
+- [x] Hold depth ≥ `depth₁` for `sustain_s` → tier 1 starts claiming, never
   exceeding `max_inflight` concurrent.
-- [ ] Burst shorter than `sustain_s` → **no** spill.
-- [ ] Free a tier-0 slot while tier 1 is active → tier 0 rescues the head job;
+- [x] Burst shorter than `sustain_s` → **no** spill.
+- [x] Free a tier-0 slot while tier 1 is active → tier 0 rescues the head job;
   no double-run (atomic claim).
-- [ ] Drain below `clear_below` → tier 1 stops claiming (hysteresis: no
+- [x] Drain below `clear_below` → tier 1 stops claiming (hysteresis: no
   flapping around `depth₁`).
-- [ ] Two levels: tier 2 activates only at its deeper/longer threshold.
-- [ ] **Opacity check**: `grep -ri runpod godserve/coordinator/` (and any
+- [x] Two levels: tier 2 activates only at its deeper/longer threshold.
+- [x] **Opacity check**: `grep -ri runpod godserve/coordinator/` (and any
   backend name) → no matches; coordinator code has no backend branches.
 
 ---

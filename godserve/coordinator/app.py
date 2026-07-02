@@ -19,7 +19,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from starlette.websockets import WebSocketState
 
 from ..db import DB
-from ..models import BlobRef, JobDefaults, JobSpec
+from ..models import BlobRef, JobDefaults, JobSpec, LevelConfig
 from ..protocol import (
     INLINE_CAP,
     Cancel,
@@ -34,6 +34,7 @@ from ..protocol import (
 )
 from .blobs import BlobStore
 from .dispatcher import Dispatcher
+from .load import LoadController, SustainedDepthPolicy
 from .pubsub import PubSub
 from .queue import Queue
 from .registry import Registry, WorkerConn
@@ -43,7 +44,9 @@ log = logging.getLogger(__name__)
 DEFAULT_LEASE_TTL_S = 30
 
 
-def create_app(db_path: str, blob_root: str) -> FastAPI:
+def create_app(
+    db_path: str, blob_root: str, levels: list[LevelConfig] | None
+) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         db = DB(db_path)
@@ -55,10 +58,12 @@ def create_app(db_path: str, blob_root: str) -> FastAPI:
         pubsub = PubSub()
         blobs = BlobStore(blob_root)
         registry = Registry(db)
-        dispatcher = Dispatcher(db, queue, pubsub, registry, blobs)
+        policy = SustainedDepthPolicy(levels or [])
+        load = LoadController(db, policy, levels or [])
+        dispatcher = Dispatcher(db, queue, pubsub, registry, blobs, load)
 
-        async def _on_requeue(job_ids: list[str]) -> None:
-            for jid in job_ids:
+        async def _on_requeue(items: list[tuple[str, int | None]]) -> None:
+            for jid, claimed_tier in items:
                 row = await db.get_job(jid)
                 if row is not None and row["state"] == "failed":
                     dispatcher._publish_terminal(
@@ -69,6 +74,9 @@ def create_app(db_path: str, blob_root: str) -> FastAPI:
                 conn = registry.find_by_job(jid)
                 if conn is not None:
                     conn.running.discard(jid)
+                # Return the paid tier's budget so the freed capacity is reusable.
+                if claimed_tier and claimed_tier > 0:
+                    load.refund(claimed_tier)
             # Requeued jobs can be picked up by idle workers immediately.
             await dispatcher.poke()
 
@@ -80,12 +88,15 @@ def create_app(db_path: str, blob_root: str) -> FastAPI:
         app.state.blobs = blobs
         app.state.registry = registry
         app.state.dispatcher = dispatcher
+        app.state.load = load
 
         registry.start_sweeper()
+        load.start()
         try:
             yield
         finally:
             await registry.stop_sweeper()
+            await load.stop()
             await db.close()
 
     app = FastAPI(lifespan=lifespan)
