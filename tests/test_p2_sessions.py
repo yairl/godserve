@@ -151,9 +151,11 @@ async def test_idle_timeout_kills_session_and_next_job_respawns(
     proc = next(iter(backend._sessions._sessions.values())).proc
     pid = proc.pid
 
-    # Wait for the idle sweeper to reap the session.
+    # Wait for the idle sweeper to reap the session AND reap the child process.
+    # live_sessions() empties when the sweeper pops the entry, but the child is
+    # only reaped by the subsequent close(); wait for both to avoid a race.
     deadline = time.time() + 15
-    while backend.live_sessions():
+    while backend.live_sessions() or proc.returncode is None:
         if time.time() > deadline:
             raise TimeoutError("idle session never reaped")
         await asyncio.sleep(0.2)

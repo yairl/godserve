@@ -93,8 +93,9 @@ class Agent:
 
         self._provider = VenvProvider(str(self._work_root))
         self._backend = _make_backend(self._provider, str(self._work_root / "scratch"))
-        # Defensive: import-path backends may not implement live_sessions().
+        # Defensive: import-path backends may not implement live_sessions()/shutdown().
         self._live_sessions = getattr(self._backend, "live_sessions", lambda: [])
+        self._backend_shutdown = getattr(self._backend, "shutdown", None)
 
         self._ws: websockets.WebSocketClientProtocol | None = None
         self._send_lock = asyncio.Lock()
@@ -266,13 +267,24 @@ class Agent:
         await self._send(Goodbye(drain=True))
         if self._slots:
             await asyncio.gather(*self._slots.values(), return_exceptions=True)
+        await self._shutdown_backend()
         self._stopping.set()
 
     async def stop(self) -> None:
         self._stopping.set()
         for task in list(self._slots.values()):
             task.cancel()
+        if self._slots:
+            await asyncio.gather(*self._slots.values(), return_exceptions=True)
+        await self._shutdown_backend()
         await self._send(Goodbye(drain=False))
+
+    async def _shutdown_backend(self) -> None:
+        if self._backend_shutdown is not None:
+            try:
+                await self._backend_shutdown()
+            except Exception as exc:
+                log.warning("backend shutdown error: %s", exc)
 
 
 async def run_agent(url: str, work_root: str, max_slots: int = 1) -> None:

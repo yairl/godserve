@@ -329,6 +329,24 @@ class SessionManager:
         if self._idle_task is None or self._idle_task.done():
             self._idle_task = asyncio.create_task(self._idle_loop())
 
+    async def shutdown(self) -> None:
+        """Cancel the idle loop and gracefully close every live session (frees
+        any GPUs). Called on worker stop/drain so no child process or child-watcher
+        thread lingers into interpreter shutdown."""
+        task = self._idle_task
+        self._idle_task = None
+        if task is not None:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        async with self._lock:
+            sessions = list(self._sessions.values())
+            self._sessions.clear()
+        for s in sessions:
+            with contextlib.suppress(Exception):
+                await s.close()
+            self._provider.release(s.env_key)
+
     async def _idle_loop(self) -> None:
         while True:
             await asyncio.sleep(_IDLE_TICK_S)

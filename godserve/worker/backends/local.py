@@ -50,6 +50,9 @@ class LocalBackend:
     def live_sessions(self) -> list[str]:
         return self._sessions.live_sessions()
 
+    async def shutdown(self) -> None:
+        await self._sessions.shutdown()
+
     async def run(self, bundle: JobBundle, io: JobIO) -> JobOutcome:
         if bundle.spec.run.mode == "serve":
             return await self._sessions.run_job(bundle, io)

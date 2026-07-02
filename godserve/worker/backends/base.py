@@ -55,3 +55,9 @@ class Backend(Protocol):
         Parallels the env layer's ``warm_keys()`` pull. The agent resolves this
         defensively so import-path backends without it still work."""
         ...
+
+    async def shutdown(self) -> None:
+        """Gracefully tear down any live sessions on worker stop/drain (frees
+        GPUs; leaves no child process into interpreter shutdown). The agent
+        resolves this defensively so import-path backends without it still work."""
+        ...
