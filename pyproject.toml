@@ -1,0 +1,36 @@
+[project]
+name = "godserve"
+version = "0.1.0"
+description = "N-tier job servicing with warm envs, hot sessions, and load-based tiering"
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi>=0.128",
+    "uvicorn>=0.40",
+    "websockets>=16",
+    "httpx>=0.28",
+    "aiosqlite>=0.22",
+    "pydantic>=2.12",
+    "pyyaml>=6",
+    "anyio>=4.12",
+]
+
+[project.scripts]
+godserve = "godserve.cli:main"
+godserve-fetch = "godserve.worker.content:fetch_main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["godserve"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

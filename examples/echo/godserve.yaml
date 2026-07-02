@@ -1,0 +1,10 @@
+name: echo-once
+python: "3.13"
+setup: setup.sh
+run:
+  script: run.sh
+  mode: once
+defaults:
+  timeout_s: 60
+  max_attempts: 2
+  max_tier: null

@@ -165,8 +165,11 @@ Startup recovery: expire all stale leases → requeue (§5 restart note).
   3. heartbeat task (interval `lease_ttl / 3`);
   4. `Cancel` → kill slot task; `Shutdown`/SIGTERM → send `goodbye{drain}`,
      finish in-flight, exit.
-  Backend chosen once at startup: `GODSERVE_BACKEND` env var → registry dict
-  `{"local": LocalBackend, "runpod": RunpodBackend}`.
+  Backend chosen once at startup from `GODSERVE_BACKEND`: `local` (built-in,
+  the default) or an import path `"module:attr"` resolving a user-provided
+  `Backend`. **No third-party backend ships in core** — do not create
+  `worker/backends/runpod.py`; a reference RunPod backend lives under
+  `examples/` (Phase 4).
 
 ### 1.6 CLI + SDK
 
@@ -181,18 +184,18 @@ Startup recovery: expire all stale leases → requeue (§5 restart note).
 
 ### Phase 1 acceptance (from §10-P1)
 
-- [ ] Submit a venv job → env built once; second job with same spec → **no
+- [x] Submit a venv job → env built once; second job with same spec → **no
   rebuild** (assert via build-log marker / timing).
-- [ ] A `godserve-fetch`ed file appears **once** in the machine cache across
+- [x] A `godserve-fetch`ed file appears **once** in the machine cache across
   two different env_keys (two specs fetching the same URL+hash).
-- [ ] Logs stream live over `GET /v1/jobs/{id}/stream`; late subscriber gets
+- [x] Logs stream live over `GET /v1/jobs/{id}/stream`; late subscriber gets
   full replay; structured result returned.
-- [ ] Kill the worker mid-job (SIGKILL) → lease expires → job requeues →
+- [x] Kill the worker mid-job (SIGKILL) → lease expires → job requeues →
   completes on worker restart; `attempt` incremented; exceeds `max_attempts`
   → `failed`.
-- [ ] >256 KB inline input rejected (413); same payload accepted via
+- [x] >256 KB inline input rejected (413); same payload accepted via
   `POST /v1/blobs` + `blob_ref`; oversized result comes back as `blob_ref`.
-- [ ] Cancel: queued job → immediate; running job → process killed, state
+- [x] Cancel: queued job → immediate; running job → process killed, state
   `canceled`.
 
 ---
@@ -320,19 +323,22 @@ Run a tier-1 worker whose backend targets a **simulated remote** — e.g.
 
 ---
 
-## Phase 4 — RunPod backend
+## Phase 4 — RunPod backend (reference, under `examples/`)
 
-Goal: the same suite passing with real remote capacity.
+Goal: the same suite passing with real remote capacity, via a **user-provided
+backend loaded through `GODSERVE_BACKEND=<import path>`** — nothing added to
+core.
 
-- `worker/backends/runpod.py` — v1 = **persistent pods with idle-timeout**
-  (best for 1–2s model-serving; hourly billing amortized; pods keep hot
-  sessions across jobs because they run the same agent/env/session code).
-  Serverless variant optional, later.
+- `examples/runpod_backend/` — a reference `Backend` implementation (not part
+  of the `godserve` package). v1 = **persistent pods with idle-timeout** (best
+  for 1–2s model-serving; hourly billing amortized; pods keep hot sessions
+  across jobs because they run the same agent/env/session code). Serverless
+  variant optional, later.
   - Pod lifecycle: lease/spawn pod on first job (RunPod API via httpx), ship
     the bundle, relay logs/partials/result back through the worker's WS;
     idle-timeout scale-down.
   - Simplest composition: the pod runs the standard agent code with
-    `GODSERVE_BACKEND=local`, and the runpod backend is a thin transport that
+    `GODSERVE_BACKEND=local`, and the reference backend is a thin transport that
     forwards the bundle and relays frames — reusing §4 wholesale.
 - Auth for the backend's remote side (shared token, backend config).
 - Blob endpoint hardening: auth token on `/v1/blobs`, size limits, disk quota.
