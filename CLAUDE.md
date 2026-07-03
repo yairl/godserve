@@ -5,10 +5,11 @@
 **godserve** provides N-tier job servicing: clients submit into a single FIFO
 queue; workers of different cost tiers pull and run jobs. Overflow tiers
 activate only under sustained queue depth; tier 0 is never gated. One worker
-structure everywhere — a `GODSERVE_BACKEND` env var selects the execution
-backend (local/runpod); the coordinator has **no concept of local vs remote,
-only tiering**. Hot sessions keep prep work (e.g. models in GPU) alive across
-consecutive 1–2s jobs.
+structure everywhere — workers always run the built-in local executor;
+`GODSERVE_BACKEND` is an opaque job-visible label (inherited by job
+subprocesses), not an execution selector. The coordinator has **no concept of
+local vs remote, only tiering**. Hot sessions keep prep work (e.g. models in
+GPU) alive across consecutive 1–2s jobs.
 
 ## Authoritative documents
 

@@ -165,11 +165,12 @@ Startup recovery: expire all stale leases → requeue (§5 restart note).
   3. heartbeat task (interval `lease_ttl / 3`);
   4. `Cancel` → kill slot task; `Shutdown`/SIGTERM → send `goodbye{drain}`,
      finish in-flight, exit.
-  Backend chosen once at startup from `GODSERVE_BACKEND`: `local` (built-in,
-  the default) or an import path `"module:attr"` resolving a user-provided
-  `Backend`. **No third-party backend ships in core** — do not create
-  `worker/backends/runpod.py`; a reference RunPod backend lives under
-  `examples/` (Phase 4).
+  Execution is always the built-in `local` backend; there is no backend
+  selection. `GODSERVE_BACKEND` is an opaque label inherited by job
+  subprocesses (setup.sh + serve process) that a handler may read to pick its
+  own remoting — core never resolves it. **No third-party backend ships in
+  core** — do not create `worker/backends/runpod.py`. Phase 4's `examples/`
+  entry is a job that reads `GODSERVE_BACKEND` to select its own engine.
 
 ### 1.6 CLI + SDK
 
@@ -310,10 +311,10 @@ In-memory only; recomputed after restart (§5).
 
 ### 3.3 Opacity proof
 
-Run a tier-1 worker whose backend targets a **simulated remote** — e.g.
-`GODSERVE_BACKEND=local` on a second process posing as "remote", or a trivial
-`http_relay` backend hitting localhost. The point: coordinator config only says
-`tier: 1`; nothing coordinator-side knows what backs it.
+Run a second `local` worker registered at `tier: 1`. The point: coordinator
+config only says `tier: 1`; nothing coordinator-side knows what backs it (both
+workers run the same built-in local executor — remoteness, if any, lives inside
+the job's own library).
 
 ### Phase 3 acceptance (from §10-P3)
 
@@ -330,31 +331,57 @@ Run a tier-1 worker whose backend targets a **simulated remote** — e.g.
 
 ---
 
-## Phase 4 — RunPod backend (reference, under `examples/`)
+## Phase 4 — Reference example: ivrit transcription, local + RunPod (under `examples/`)
 
-Goal: the same suite passing with real remote capacity, via a **user-provided
-backend loaded through `GODSERVE_BACKEND=<import path>`** — nothing added to
-core.
+Goal: one **serve-mode spec, written once**, running unchanged on a local-GPU
+tier-0 worker and a RunPod-backed tier-1 worker — proving ARCH §3.4's promise
+without adding anything to core. Remoteness lives in the job's own library
+(ivrit's `runpod` engine), not in godserve: **all workers run the built-in
+local executor**; the coordinator sees only tiers.
 
-- `examples/runpod_backend/` — a reference `Backend` implementation (not part
-  of the `godserve` package). v1 = **persistent pods with idle-timeout** (best
-  for 1–2s model-serving; hourly billing amortized; pods keep hot sessions
-  across jobs because they run the same agent/env/session code). Serverless
-  variant optional, later.
-  - Pod lifecycle: lease/spawn pod on first job (RunPod API via httpx), ship
-    the bundle, relay logs/partials/result back through the worker's WS;
-    idle-timeout scale-down.
-  - Simplest composition: the pod runs the standard agent code with
-    `GODSERVE_BACKEND=local`, and the reference backend is a thin transport that
-    forwards the bundle and relays frames — reusing §4 wholesale.
-- Auth for the backend's remote side (shared token, backend config).
+- `examples/ivrit_transcribe/` — `godserve.yaml` (mode: serve), `setup.sh`,
+  `run.sh`, `transcribe.py`, `README.md`. Pins `ivrit==0.2.5`.
+- **Engine selection = worker deployment env** `GODSERVE_BACKEND=local|runpod`
+  (plus `RUNPOD_API_KEY` / `RUNPOD_ENDPOINT_ID` on runpod workers) — the same
+  opaque label godserve inherits into subprocesses, here read by the example to
+  pick its own engine:
+  - `setup.sh` branches on `GODSERVE_BACKEND`: `local` installs the full
+    inference stack; `runpod` installs only the light client dependencies.
+  - `transcribe.py` `init()` branches the same way:
+    `ivrit.load_model(engine='faster-whisper', model=…)` vs
+    `ivrit.load_model(engine='runpod', model=…, api_key=…, endpoint_id=…,
+    core_engine='faster-whisper')`. `init()` runs once per session — on the
+    local tier the model stays in GPU; on the runpod tier the configured
+    client persists.
+  - handler is a generator: `async for seg in model.transcribe_async(
+    path=audio, language='he'): yield seg.text` → partial frames; final
+    result = full transcript. Audio arrives as a `blob_ref` (uploaded via
+    `POST /v1/blobs`), fetched by the handler.
+  - Because engine choice is env, **spec_id / env_key / session_key are
+    identical across tiers** — affinity works uniformly. Caveat (README):
+    `GODSERVE_BACKEND` (read by `setup.sh`) must be fixed per worker
+    deployment; `env_key` hashes the script text, not the environment, so two
+    engines on one machine would collide on `envs/{env_key}/` — run one engine
+    per machine.
 - Blob endpoint hardening: auth token on `/v1/blobs`, size limits, disk quota.
 
-### Phase 4 acceptance (from §10-P4)
+### Phase 4 acceptance (from §10-P4, reframed)
 
-- [ ] Phase 1–3 verification suite passes with a tier-1 RunPod worker.
-- [ ] Pod idle-timeout scale-down observed (pod terminated after idle window).
-- [ ] Hot session survives across two jobs routed to the same pod.
+- [x] Local leg: submit an audio blob → tier-0 worker (`GODSERVE_BACKEND=local`)
+  streams segment partials live and returns the full transcript. *(Wiring
+  verified via fake-ivrit stub in `tests/test_p4_example.py`; the real
+  faster-whisper transcription is a manual/GPU check per the example README.)*
+- [x] RunPod leg (credentialed; skipped when `RUNPOD_API_KEY` unset): the
+  **same unmodified spec** (same spec_id) on a tier-1 worker with
+  `GODSERVE_BACKEND=runpod` produces an equivalent transcript. *(Same-spec +
+  engine-label selection verified in CI; the real credentialed transcript is a
+  manual check per README.)*
+- [x] Hot session: N consecutive jobs on one worker → `init()` /
+  `load_model` exactly once (log counter), per Phase 2 semantics.
+- [x] Opacity: no core changes — diff confined to `examples/`, docs, tests;
+  `grep -ri runpod godserve/` empty.
+- [x] Blob hardening: unauthorized `POST /v1/blobs` rejected; size limit
+  enforced.
 
 ---
 

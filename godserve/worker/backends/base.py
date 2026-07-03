@@ -52,12 +52,10 @@ class Backend(Protocol):
     def live_sessions(self) -> list[str]:
         """session_keys of live (idle+busy) sessions; ``[]`` if none.
 
-        Parallels the env layer's ``warm_keys()`` pull. The agent resolves this
-        defensively so import-path backends without it still work."""
+        Parallels the env layer's ``warm_keys()`` pull."""
         ...
 
     async def shutdown(self) -> None:
         """Gracefully tear down any live sessions on worker stop/drain (frees
-        GPUs; leaves no child process into interpreter shutdown). The agent
-        resolves this defensively so import-path backends without it still work."""
+        GPUs; leaves no child process into interpreter shutdown)."""
         ...

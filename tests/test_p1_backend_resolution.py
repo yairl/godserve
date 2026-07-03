@@ -1,7 +1,9 @@
-"""Unit test for GODSERVE_BACKEND resolution in the worker agent.
+"""Unit test for the worker's execution backend construction.
 
-Backends are a pluggable seam: `local` is the built-in, `module:attr` is an
-import-path plugin instantiated zero-arg, and anything else fails fast.
+godserve always executes via the built-in LocalBackend. ``GODSERVE_BACKEND`` is
+an opaque label inherited by job subprocesses (setup.sh + serve process), never
+resolved by core into a backend selection — so whatever its value, the agent
+constructs a LocalBackend.
 """
 
 from __future__ import annotations
@@ -11,7 +13,6 @@ import pytest
 from godserve.worker.agent import _make_backend
 from godserve.worker.backends.local import LocalBackend
 from godserve.worker.envs.venv import VenvProvider
-from tests.fixtures.dummy_backend import DummyBackend
 
 
 def _make(tmp_path):
@@ -19,43 +20,14 @@ def _make(tmp_path):
     return provider, str(tmp_path / "scratch")
 
 
-def test_default_unset_is_local(tmp_path, monkeypatch):
-    monkeypatch.delenv("GODSERVE_BACKEND", raising=False)
+@pytest.mark.parametrize(
+    "label",
+    [None, "local", "runpod", "examples.runpod_backend:RunpodBackend"],
+)
+def test_backend_is_always_local(tmp_path, monkeypatch, label):
+    if label is None:
+        monkeypatch.delenv("GODSERVE_BACKEND", raising=False)
+    else:
+        monkeypatch.setenv("GODSERVE_BACKEND", label)
     provider, scratch = _make(tmp_path)
     assert isinstance(_make_backend(provider, scratch), LocalBackend)
-
-
-def test_local_is_local(tmp_path, monkeypatch):
-    monkeypatch.setenv("GODSERVE_BACKEND", "local")
-    provider, scratch = _make(tmp_path)
-    assert isinstance(_make_backend(provider, scratch), LocalBackend)
-
-
-def test_import_path_resolves(tmp_path, monkeypatch):
-    monkeypatch.setenv("GODSERVE_BACKEND", "tests.fixtures.dummy_backend:DummyBackend")
-    provider, scratch = _make(tmp_path)
-    assert isinstance(_make_backend(provider, scratch), DummyBackend)
-
-
-def test_bareword_raises(tmp_path, monkeypatch):
-    monkeypatch.setenv("GODSERVE_BACKEND", "nonexistent")
-    provider, scratch = _make(tmp_path)
-    with pytest.raises(ValueError):
-        _make_backend(provider, scratch)
-
-
-def test_bad_import_path_raises(tmp_path, monkeypatch):
-    monkeypatch.setenv("GODSERVE_BACKEND", "no.such.module:X")
-    provider, scratch = _make(tmp_path)
-    with pytest.raises(ValueError):
-        _make_backend(provider, scratch)
-
-
-def test_vendor_bareword_is_not_builtin(tmp_path, monkeypatch):
-    # A vendor name like "runpod" is not a core backend: it must be provided as
-    # an import path to user/example code. Backend opacity means core never
-    # special-cases a vendor bareword.
-    monkeypatch.setenv("GODSERVE_BACKEND", "runpod")
-    provider, scratch = _make(tmp_path)
-    with pytest.raises(ValueError):
-        _make_backend(provider, scratch)

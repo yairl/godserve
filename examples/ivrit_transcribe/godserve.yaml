@@ -1,0 +1,14 @@
+name: ivrit-transcribe
+# ivrit 0.2.5 pulls faster-whisper / ctranslate2, which have no 3.13 wheels at
+# the time this example was written; pin 3.12 (what the reference deployment
+# uses). Bump when upstream ships 3.13 wheels.
+python: "3.12"
+setup: setup.sh
+run:
+  script: run.sh
+  mode: serve
+defaults:
+  # Transcription of a full voice message can take a while; keep it generous.
+  timeout_s: 900
+  max_attempts: 2
+  max_tier: null

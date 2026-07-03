@@ -178,7 +178,7 @@ class Dispatcher:
         async def _one():
             yield raw
 
-        blob_id, size = await self._blobs.store(_one())
+        blob_id, size = await self._blobs.store(_one(), None)
         await self._db.upsert_blob(blob_id, size, str(self._blobs.path_for(blob_id)))
         return BlobRef(blob_ref=blob_id, sha256=blob_id, size=size).model_dump()
 

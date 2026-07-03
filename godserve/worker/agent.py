@@ -3,14 +3,14 @@
 Connects the outbound WS with backoff, sends ``hello`` (tier from
 ``GODSERVE_TIER``, warm envs from a disk scan), advertises ``ready`` on each free
 slot, runs the backend on ``assign`` streaming frames up the WS, heartbeats at
-``lease_ttl/3``, and handles ``cancel``/``shutdown``/``goodbye``. The backend is
-chosen once at startup via ``GODSERVE_BACKEND``.
+``lease_ttl/3``, and handles ``cancel``/``shutdown``/``goodbye``. Execution is
+always the built-in :class:`LocalBackend`; ``GODSERVE_BACKEND`` is an opaque
+label inherited by job subprocesses, never resolved by core.
 """
 
 from __future__ import annotations
 
 import asyncio
-import importlib
 import logging
 import os
 import socket
@@ -44,36 +44,14 @@ DEFAULT_LEASE_TTL_S = 30
 
 
 def _make_backend(provider: VenvProvider, scratch_root: str):
-    """Resolve ``GODSERVE_BACKEND`` (default ``local``) into a backend instance.
+    """Construct the worker's execution backend.
 
-    Three forms, discriminated strictly on the presence of ``:``:
-
-    - ``local`` — the built-in :class:`LocalBackend`, constructed with the
-      core-owned ``(provider, scratch_root)`` signature.
-    - ``"module:attr"`` — a pluggable backend loaded by import path. The class
-      is instantiated **zero-arg** (``cls()``); a loaded backend reads whatever
-      it needs from its own ``GODSERVE_*`` env — core passes it nothing
-      backend-specific.
-    - any other bareword — a clean ``ValueError``. There is no silent fallback
-      to ``local``; bad import paths are wrapped into ``ValueError`` too.
+    godserve always executes via the built-in :class:`LocalBackend`.
+    ``GODSERVE_BACKEND`` is an opaque label inherited by job subprocesses
+    (setup.sh + the serve process) so a handler may pick its own remoting; core
+    never reads it to select a backend.
     """
-    name = os.environ.get("GODSERVE_BACKEND", "local")
-    if name == "local":
-        return LocalBackend(provider, scratch_root)
-    if ":" in name:
-        module_name, _, attr = name.partition(":")
-        try:
-            module = importlib.import_module(module_name)
-            cls = getattr(module, attr)
-        except (ImportError, AttributeError) as exc:
-            raise ValueError(
-                f"GODSERVE_BACKEND={name!r} could not be imported: {exc}"
-            ) from exc
-        return cls()
-    raise ValueError(
-        f"GODSERVE_BACKEND={name!r} is not valid; use 'local' or an import "
-        "path of the form 'module:attr'"
-    )
+    return LocalBackend(provider, scratch_root)
 
 
 class Agent:
@@ -93,9 +71,6 @@ class Agent:
 
         self._provider = VenvProvider(str(self._work_root))
         self._backend = _make_backend(self._provider, str(self._work_root / "scratch"))
-        # Defensive: import-path backends may not implement live_sessions()/shutdown().
-        self._live_sessions = getattr(self._backend, "live_sessions", lambda: [])
-        self._backend_shutdown = getattr(self._backend, "shutdown", None)
 
         self._ws: websockets.WebSocketClientProtocol | None = None
         self._send_lock = asyncio.Lock()
@@ -138,7 +113,7 @@ class Agent:
             tier=self._tier,
             max_slots=self._max_slots,
             warm_envs=self.warm_envs(),
-            live_sessions=self._live_sessions(),
+            live_sessions=self._backend.live_sessions(),
         ))
         await self._send_ready()
         hb = asyncio.create_task(self._heartbeat_loop())
@@ -240,7 +215,7 @@ class Agent:
             await self._send(Ready(
                 slots_free=self.free_slots(),
                 warm_envs=self.warm_envs(),
-                live_sessions=self._live_sessions(),
+                live_sessions=self._backend.live_sessions(),
             ))
 
     async def _heartbeat_loop(self) -> None:
@@ -280,11 +255,10 @@ class Agent:
         await self._send(Goodbye(drain=False))
 
     async def _shutdown_backend(self) -> None:
-        if self._backend_shutdown is not None:
-            try:
-                await self._backend_shutdown()
-            except Exception as exc:
-                log.warning("backend shutdown error: %s", exc)
+        try:
+            await self._backend.shutdown()
+        except Exception as exc:
+            log.warning("backend shutdown error: %s", exc)
 
 
 async def run_agent(url: str, work_root: str, max_slots: int = 1) -> None:

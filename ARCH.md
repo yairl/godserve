@@ -60,8 +60,9 @@ about what backs a tier (a laptop, a GPU host, a RunPod pool).
 ### Worker
 
 One structure everywhere: **pull bundle → ensure env → execute → stream →
-result**. `GODSERVE_BACKEND` selects the execution backend (§3.4); tier is
-registration config.
+result**. Execution is always the built-in local executor (§3.4);
+`GODSERVE_BACKEND` is an opaque job-visible label, not a backend selector. Tier
+is registration config.
 
 One persistent **outbound** websocket per worker (NAT-friendly):
 
@@ -192,10 +193,11 @@ JobBundle = { job_id, spec (resolved), inputs | blob_ref,
 No references to coordinator-local state — the bundle runs anywhere, under any
 backend.
 
-### 3.4 Single worker structure — backends behind an env var
+### 3.4 Single worker structure — one execution path
 
-Every worker runs the same loop; only the execution **backend** differs,
-selected by `GODSERVE_BACKEND` in deployment config, invisible to godserve:
+Every worker runs the same loop and the same execution path: godserve ships
+**one** built-in executor and always uses it. The internal `Backend` Protocol
+is the seam through which both `once` and `serve` modes dispatch:
 
 ```python
 class Backend(Protocol):
@@ -204,25 +206,18 @@ class Backend(Protocol):
         returns {status, exit_code, result|error}."""
 ```
 
-**Backends are a pluggable seam. godserve core ships exactly one built-in
-backend — `local` — and never bundles a third-party integration.**
-`GODSERVE_BACKEND` resolves at worker startup as:
-
-- **`local`** (the default, typical tier 0): the built-in backend that executes
-  via the env/session layer (§4) on this host.
-- **an import path `"module:attr"`**: a user-provided `Backend` implementation
-  loaded from outside core. A RunPod deployment (typical overflow tiers) sets
-  e.g. `GODSERVE_BACKEND=examples.runpod_backend:RunpodBackend`; that backend
-  ships the same bundle to capacity it manages and relays streamed logs + the
-  final result. It may hold persistent pods — which then keep **hot sessions**
-  across jobs (§4.2), since the pod runs the same env/session code — or use a
-  serverless variant. That choice lives entirely in the user's backend, **not
-  in godserve**; coordinator, protocol, and scheduler see only a worker at some
-  tier. A reference RunPod backend lives under `examples/` (§7), never in core.
+There is no execution-backend selection. `GODSERVE_BACKEND` is **not** a
+godserve concept beyond a label: its raw value is inherited (via
+`os.environ.copy()`) by the setup.sh build subprocess and the serve process, so
+a job's own handler may read it to choose *its own* remoting — e.g. the
+reference example (§8) reads it to select ivrit's `faster-whisper` (local) vs
+`runpod` engine. Remoteness, when a job wants it, lives inside the job's
+library; godserve core always runs the built-in local executor on-host and
+never resolves a "remote" backend.
 
 Why this holds together: warm/hot **affinity is just keys**. A worker
-advertises the `env_key`s / `session_key`s it can serve hot; godserve never
-knows whether that warmth lives on the host or on a pod the backend manages.
+advertises the `env_key`s / `session_key`s it can serve hot; the coordinator
+sees only a worker at some tier, never how or where the work runs.
 
 ---
 
@@ -236,6 +231,12 @@ skippable when warm:
 | **env** (fs: venv/docker) | `env_key = H(python + setup.sh)` | `setup.sh`, once per key | fork/exec ~10ms |
 | **session** (live process, init done) | `session_key = H(env_key + run.sh + mode)` | `run.sh` spawn + init, once per process | **~1ms IPC — model stays in GPU** |
 | job | — | `handler(inputs)` per job | the job itself |
+
+`env_key` hashes the *text* of `setup.sh`, not the environment it runs in. A
+`setup.sh` that branches on inherited env vars (e.g. `GODSERVE_BACKEND`)
+therefore produces the same `env_key` regardless of which branch runs, so two
+deployments feeding different values would share and collide on
+`envs/{env_key}/`. Fix such vars per deployment — one value per machine.
 
 ### 4.1 Env layer (`EnvProvider`, pluggable) + machine-wide content cache
 
@@ -404,9 +405,8 @@ godserve/
     pubsub.py               # log fan-out
   worker/
     agent.py                # the single worker loop (identical everywhere)
-    backends/{base,local}.py          # base protocol + built-in local backend;
-                                      # GODSERVE_BACKEND=<import path> loads a
-                                      # third-party backend from outside core
+    backends/{base,local}.py          # internal execution seam + the sole
+                                      # built-in local backend (always used)
     envs/{base,venv}.py     # EnvProvider; DockerProvider later
     content.py              # machine-wide content-addressed cache (godserve-fetch)
     session.py              # session manager: spawn run.sh, READY, IPC, idle/evict
@@ -425,7 +425,5 @@ godserve/
 - DockerProvider env kind.
 - Artifacts / S3-compatible object storage backing for blobs.
 - Smarter `LoadPolicy` implementations (all confined to `coordinator/load.py`).
-- Reference RunPod backend under `examples/` — a user-provided `Backend`
-  loaded via `GODSERVE_BACKEND=<import path>` (§3.4), never shipped in core.
 
 See `PLAN.md` for the phased implementation plan and acceptance criteria.

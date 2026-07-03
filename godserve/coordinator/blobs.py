@@ -15,6 +15,14 @@ from typing import AsyncIterator
 import anyio
 
 
+class BlobTooLarge(Exception):
+    """Raised mid-stream when an upload exceeds the configured max size."""
+
+    def __init__(self, max_size: int):
+        super().__init__(f"blob exceeds max size {max_size} bytes")
+        self.max_size = max_size
+
+
 class BlobStore:
     def __init__(self, root: str):
         self._dir = Path(root) / "blobs"
@@ -26,16 +34,24 @@ class BlobStore:
     def exists(self, blob_id: str) -> bool:
         return self.path_for(blob_id).exists()
 
-    async def store(self, chunks: AsyncIterator[bytes]) -> tuple[str, int]:
-        """Stream chunks to disk, returning (blob_id, size)."""
+    async def store(
+        self, chunks: AsyncIterator[bytes], max_size: int | None
+    ) -> tuple[str, int]:
+        """Stream chunks to disk, returning (blob_id, size).
+
+        ``max_size`` (bytes) caps the upload; if exceeded mid-stream the partial
+        temp file is discarded and :class:`BlobTooLarge` is raised — so an
+        oversize body is rejected during streaming, never buffered whole."""
         h = hashlib.sha256()
         size = 0
         fd, tmp = tempfile.mkstemp(dir=self._dir, prefix=".tmp-")
         try:
             async with await anyio.open_file(fd, "wb") as f:
                 async for chunk in chunks:
-                    h.update(chunk)
                     size += len(chunk)
+                    if max_size is not None and size > max_size:
+                        raise BlobTooLarge(max_size)
+                    h.update(chunk)
                     await f.write(chunk)
             blob_id = h.hexdigest()
             dest = self.path_for(blob_id)

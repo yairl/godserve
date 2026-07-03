@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -32,7 +33,7 @@ from ..protocol import (
     Goodbye,
     parse_frame,
 )
-from .blobs import BlobStore
+from .blobs import BlobStore, BlobTooLarge
 from .dispatcher import Dispatcher
 from .load import LoadController, SustainedDepthPolicy
 from .pubsub import PubSub
@@ -42,6 +43,28 @@ from .registry import Registry, WorkerConn
 log = logging.getLogger(__name__)
 
 DEFAULT_LEASE_TTL_S = 30
+# Default per-upload cap when GODSERVE_BLOB_MAX_BYTES is unset (1 GiB).
+DEFAULT_BLOB_MAX_BYTES = 1024 * 1024 * 1024
+
+
+class BlobConfig:
+    """Blob-endpoint policy resolved from GODSERVE_ env at startup.
+
+    ``token`` None → open (back-compat). ``disk_quota_bytes`` None → no quota.
+    """
+
+    def __init__(self, token: str | None, max_bytes: int, disk_quota_bytes: int | None):
+        self.token = token
+        self.max_bytes = max_bytes
+        self.disk_quota_bytes = disk_quota_bytes
+
+
+def _load_blob_config() -> BlobConfig:
+    token = os.environ.get("GODSERVE_BLOB_TOKEN") or None
+    max_bytes = int(os.environ.get("GODSERVE_BLOB_MAX_BYTES", DEFAULT_BLOB_MAX_BYTES))
+    quota_raw = os.environ.get("GODSERVE_BLOB_DISK_QUOTA_BYTES")
+    disk_quota_bytes = int(quota_raw) if quota_raw else None
+    return BlobConfig(token, max_bytes, disk_quota_bytes)
 
 
 def create_app(
@@ -89,6 +112,8 @@ def create_app(
         app.state.registry = registry
         app.state.dispatcher = dispatcher
         app.state.load = load
+        app.state.blob_config = _load_blob_config()
+        app.state.blob_root = blob_root
 
         registry.start_sweeper()
         load.start()
@@ -246,7 +271,20 @@ def _register_routes(app: FastAPI) -> None:
     async def post_blob(request: Request):
         db: DB = app.state.db
         blobs: BlobStore = app.state.blobs
-        blob_id, size = await blobs.store(request.stream())
+        cfg: BlobConfig = app.state.blob_config
+
+        if cfg.token is not None and not _blob_authorized(request, cfg.token):
+            raise HTTPException(status_code=401, detail="unauthorized")
+
+        if cfg.disk_quota_bytes is not None:
+            used = _blob_dir_bytes(app.state.blob_root)
+            if used >= cfg.disk_quota_bytes:
+                raise HTTPException(status_code=507, detail="blob storage quota exceeded")
+
+        try:
+            blob_id, size = await blobs.store(request.stream(), cfg.max_bytes)
+        except BlobTooLarge:
+            raise HTTPException(status_code=413, detail="blob exceeds size limit")
         await db.upsert_blob(blob_id, size, str(blobs.path_for(blob_id)))
         return {"blob_id": blob_id, "url": f"/v1/blobs/{blob_id}"}
 
@@ -266,6 +304,23 @@ def _register_routes(app: FastAPI) -> None:
     @app.websocket("/v1/worker")
     async def worker_ws(ws: WebSocket):
         await _worker_handler(app, ws)
+
+
+def _blob_authorized(request: Request, token: str) -> bool:
+    auth = request.headers.get("authorization", "")
+    if auth.startswith("Bearer "):
+        return auth[len("Bearer ") :] == token
+    return request.headers.get("x-godserve-blob-token") == token
+
+
+def _blob_dir_bytes(blob_root: str) -> int:
+    total = 0
+    for entry in Path(blob_root, "blobs").glob("*"):
+        try:
+            total += entry.stat().st_size
+        except OSError:
+            pass
+    return total
 
 
 async def _send_terminal(ws: WebSocket, db: DB, row) -> None:
