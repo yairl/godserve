@@ -118,6 +118,27 @@ def handler(inputs, ctx):   # runs per job; ctx.emit(chunk) streams partials
 serve(handler, init=init)
 ```
 
+## How a job flows
+
+1. **Submit** — a client `POST`s a job (spec + `inputs`) to the coordinator,
+   which appends it to the single FIFO queue and returns a `job_id`.
+2. **Dispatch** — a worker of an eligible tier atomically claims the job. For
+   `serve` specs the worker reuses a hot session whose `session_key` matches, or
+   spawns one (running `init()` once) if none is live.
+3. **Session subprocess** — the handler runs in that **separate process**, not
+   in the worker's event loop. Its CPU-bound or blocking work (inference, blob
+   fetch) therefore cannot stall the worker or its other slots; a hung handler
+   is bounded by `timeout_s`, which kills only that process.
+4. **Lossless stream** — each `ctx.emit(chunk)` (and stdout/stderr) travels
+   fd 3 → agent FIFO → WebSocket → coordinator, which **persists it (commit)
+   before publishing**. `WS /v1/jobs/{job_id}/stream` clients see every chunk in
+   emit order and gap-repair any miss from the DB by `seq`. Emission may block
+   the handler as backpressure; nothing is silently dropped.
+5. **Result** — the terminal `result` (uncapped, auto-spilled to a blob above
+   256 KB) is persisted; polling clients read it from `GET /v1/jobs/{job_id}`,
+   streaming clients receive it as the final frame. The session stays hot for
+   the next matching job.
+
 ## HTTP / WebSocket API
 
 Served by the coordinator (default `http://127.0.0.1:8000`):

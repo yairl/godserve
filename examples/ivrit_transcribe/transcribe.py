@@ -1,5 +1,11 @@
 """serve-mode ivrit transcription task.
 
+This module runs inside the godserve *session subprocess* — a process the worker
+spawns once per hot session and keeps alive across consecutive jobs. The worker
+agent itself never imports or runs this code; it only relays fd-3 frames and the
+WebSocket. So the CPU-bound / blocking work below (model inference, blob fetch)
+cannot stall the worker's event loop — process isolation is the boundary.
+
 One spec, two engines, chosen by GODSERVE_BACKEND (the opaque label godserve
 inherits into this process):
 
@@ -7,13 +13,14 @@ inherits into this process):
   runpod -> ivrit.load_model(engine='runpod', ...)         — remote endpoint
 
 init() loads the model once per session (hot across consecutive jobs); the
-generator handler streams each transcribed segment as a partial and returns the
-full concatenated transcript. Audio arrives as a blob_ref in inputs and is
+handler streams each transcribed segment as a partial via ctx.emit and returns
+the full concatenated transcript. Audio arrives as a blob_ref in inputs and is
 fetched to a local path via the on-PATH `godserve-fetch` helper.
 """
 
 import asyncio
 import os
+import shutil
 import subprocess
 import tempfile
 
@@ -44,11 +51,14 @@ def init():
 
 
 def _fetch_audio(inputs) -> str:
-    """Fetch the audio blob to a local path. Inputs carry a blob_ref (a URL or
-    blob_id) and its sha256, mirroring godserve's blob convention (§4.6)."""
-    ref = inputs["blob_ref"]
-    sha256 = inputs["sha256"]
-    dest = os.path.join(tempfile.mkdtemp(), "audio.bin")
+    """Fetch the audio blob to a fresh temp dir. Inputs carry a blob_ref (a URL
+    or blob_id) and its sha256, mirroring godserve's blob convention (§4.6)."""
+    try:
+        ref = inputs["blob_ref"]
+        sha256 = inputs["sha256"]
+    except KeyError as exc:
+        raise ValueError(f"inputs missing required key {exc}") from exc
+    dest = os.path.join(tempfile.mkdtemp(prefix="ivrit-"), "audio.bin")
     subprocess.run(
         ["godserve-fetch", ref, dest, "--sha256", sha256],
         check=True,
@@ -56,17 +66,20 @@ def _fetch_audio(inputs) -> str:
     return dest
 
 
+async def _transcribe(audio_path: str, ctx) -> list[str]:
+    segments = []
+    async for seg in _model.transcribe_async(path=audio_path, language="he"):
+        segments.append(seg.text)
+        ctx.emit(seg.text)
+    return segments
+
+
 def handler(inputs, ctx):
     audio_path = _fetch_audio(inputs)
-
-    async def _transcribe():
-        segments = []
-        async for seg in _model.transcribe_async(path=audio_path, language="he"):
-            segments.append(seg.text)
-            ctx.emit(seg.text)
-        return segments
-
-    segments = asyncio.run(_transcribe())
+    try:
+        segments = asyncio.run(_transcribe(audio_path, ctx))
+    finally:
+        shutil.rmtree(os.path.dirname(audio_path), ignore_errors=True)
     return {"transcript": "".join(segments)}
 
 

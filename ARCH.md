@@ -294,6 +294,14 @@ upstream as `output`.
   via blobs (§4.6). The terminal `{job_id, result}` frame is unchanged and
   **uncapped** (auto-spills to a blob above the cap; polling clients see only
   the final result).
+- **Process isolation**: the handler always runs in the session subprocess, a
+  separate OS process from the worker agent. The agent's event loop only pumps
+  fd-3 frames and the WebSocket; it never imports or calls handler code. So a
+  handler's synchronous/CPU-bound work (model inference, blob fetch, a blocking
+  `sendall` on a slow stream) cannot stall the worker or its other slots. A hung
+  handler is contained: `timeout_s` kills just that session's process. One job
+  runs at a time per session; concurrency comes from `--slots`/`max_slots` and
+  from running multiple workers, never from threading inside a session.
 - A live session **receives the next job iff `session_key` matches** — no
   respawn, no re-init, no model reload. Idle timeout ⇒ graceful exit (frees
   GPU). Crash mid-job ⇒ that job requeues; the session respawns on demand.
