@@ -1,6 +1,6 @@
 ---
 name: reviewer
-description: MUST BE USED as the final quality gate after the coder finishes any change. Use PROACTIVELY to enforce NO HACK and NO OVER-ENGINEERING policies plus godserve's hard invariants (backend opacity, 256 KB cap, non-blocking streaming, atomic claim, deferred-stays-deferred). No change is complete until reviewer returns ✅ APPROVED.
+description: MUST BE USED as the final quality gate after the coder finishes any change. Use PROACTIVELY to enforce NO HACK and NO OVER-ENGINEERING policies plus godserve's hard invariants (backend opacity, 256 KB cap, lossless ordered streaming, atomic claim, deferred-stays-deferred). No change is complete until reviewer returns ✅ APPROVED.
 tools: Read, Grep, Glob, Bash
 ---
 
@@ -43,10 +43,13 @@ Reject:
    is its entire character arc. Protect it.
 2. **Atomic claim**: every `queued → assigned` transition goes through
    `db.claim_job` (grep for stray `UPDATE jobs` / state writes).
-3. **Non-blocking streaming**: log/partial emission paths use bounded
-   buffers with drop-oldest; no `await` on a subscriber in a hot path.
-4. **256 KB cap**: enforced at ingestion (`/v1/jobs`, results, chunk emission),
-   oversized results routed to blobs.
+3. **Lossless ordered streaming**: log/partial emission is end-to-end lossless —
+   a single agent FIFO, persist-before-publish, and client gap-repair from the
+   DB. Emission may block the handler (backpressure); frames are never silently
+   dropped. The internal pubsub tail stays drop-oldest (wake-up channel only).
+4. **256 KB cap**: `inputs` and per-element partials/logs enforced as a hard
+   error at emission (oversized/non-JSON partial raises, session survives);
+   terminal results uncapped and auto-routed to blobs above the cap.
 5. **Deferred stays deferred**: no prep/Docker/S3 logic (`/v1/prewarm` returns
    501; `Prepare` frame defined but unhandled).
 6. **serve_shim.py is stdlib-only**: check its imports.

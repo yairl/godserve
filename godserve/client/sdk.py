@@ -69,7 +69,7 @@ class Client:
         import json
 
         uri = f"{self._ws_base()}/v1/jobs/{job_id}/stream"
-        async with websockets.connect(uri) as ws:
+        async with websockets.connect(uri, max_size=None) as ws:
             async for raw in ws:
                 frame = json.loads(raw)
                 yield frame

@@ -30,10 +30,16 @@ in v1.
 
 1. **Backend opacity**: no backend-specific names or branches anywhere under
    `godserve/coordinator/` (`grep -ri runpod godserve/coordinator/` must be empty).
-2. **256 KB inline cap** on `inputs`/`result`/stream chunks; larger payloads go
-   through blobs (`ARCH.md` §4.6).
-3. **Non-blocking streaming**: partial/log emission must never backpressure a
-   running handler or session (bounded buffers, drop-oldest).
+2. **256 KB inline cap** on `inputs` and per-element stream chunks (partials/
+   logs), enforced as a **hard error at emission** — an oversized or non-JSON
+   partial raises in the handler (the session survives); larger payloads go
+   through blobs (`ARCH.md` §4.6). Terminal `result`s are **uncapped** and
+   auto-spill to blobs above the cap.
+3. **End-to-end lossless ordered streaming**: partial/log emission may **block**
+   the handler as backpressure (it counts against `timeout_s`); frames are never
+   silently dropped. A single agent FIFO + persist-before-publish makes emit
+   order == delivery order; client streams gap-repair from the DB. The internal
+   pubsub tail stays drop-oldest — it is a wake-up channel, the DB is the truth.
 4. **Atomic claim**: job state transitions from `queued` happen only via the
    single `claim_job` UPDATE; never bypass it.
 5. **Deferred features stay deferred**: ahead-of-time prep (`prepare`,

@@ -20,7 +20,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import queue
 import socket
 import sys
 import threading
@@ -31,10 +30,6 @@ import types
 # shim is stdlib-only and cannot import the package.
 INLINE_CAP = 256 * 1024
 
-# Bounded partial buffer depth; drop-oldest when full so the handler is never
-# backpressured by a slow/absent stream subscriber (invariant #3).
-_PARTIAL_QUEUE_MAX = 256
-
 _SESSION_FD = 3
 
 log = logging.getLogger("godserve.serve")
@@ -43,8 +38,10 @@ log = logging.getLogger("godserve.serve")
 class Ctx:
     """Per-job handler context (§4.2, minimal v1).
 
-    ``emit(chunk)`` enqueues a partial non-blockingly; ``chunk`` must be
-    JSON-serializable. No async, no coordinator handle, no blob API.
+    ``emit(chunk)`` streams a partial with a blocking write; ``chunk`` must be
+    JSON-serializable and within the 256 KB inline cap, else emit raises and the
+    job fails loudly (the session survives). No async, no coordinator handle, no
+    blob API.
     """
 
     def __init__(self, job_id: str, scratch_dir: str, logger: logging.Logger, emit):
@@ -58,60 +55,38 @@ class Ctx:
 
 
 class _Writer:
-    """Single owner of fd 3 writes: a dedicated thread drains a bounded queue.
+    """Single owner of fd 3 writes: a lock guards a blocking ``sendall``.
 
-    Partials enqueue non-blocking drop-oldest; the terminal result enqueues with
-    a blocking put (allowed only post-return — it never stalls computation and
-    FIFO guarantees it lands after all partials for that job)."""
+    Losslessness is the requirement, not throughput: emit blocks the handler on
+    a full kernel buffer (backpressure) rather than dropping. Oversize/non-JSON
+    partials raise so the job fails loudly; the session survives for the next
+    job. ``OSError`` from ``sendall`` propagates (the session is dying)."""
 
     def __init__(self, sock: socket.socket):
         self._sock = sock
-        self._q: queue.Queue = queue.Queue(maxsize=_PARTIAL_QUEUE_MAX)
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
+        self._lock = threading.Lock()
 
-    def _run(self) -> None:
-        while True:
-            frame = self._q.get()
-            if frame is None:
-                return
-            try:
-                self._sock.sendall(json.dumps(frame).encode("utf-8") + b"\n")
-            except OSError as exc:
-                log.debug("session write failed: %s", exc)
-                return
+    def _send(self, frame: dict) -> None:
+        line = json.dumps(frame).encode("utf-8") + b"\n"
+        with self._lock:
+            self._sock.sendall(line)
 
     def emit_partial(self, job_id: str, chunk) -> None:
         try:
             data = json.dumps(chunk)
         except (TypeError, ValueError) as exc:
-            print(f"godserve: dropped non-JSON partial: {exc}", file=sys.stderr)
-            return
+            raise ValueError(f"partial is not JSON-serializable: {exc}") from exc
         if len(data.encode("utf-8")) > INLINE_CAP:
-            # Drop, never truncate (invariant #2). Terminal result is not capped.
-            print("godserve: dropped partial over 256 KB cap", file=sys.stderr)
-            return
-        frame = {"t": "session_partial", "job_id": job_id, "data": data}
-        try:
-            self._q.put_nowait(frame)
-        except queue.Full:
-            try:
-                self._q.get_nowait()  # drop oldest
-            except queue.Empty:
-                pass
-            try:
-                self._q.put_nowait(frame)
-            except queue.Full:
-                pass
+            raise ValueError("partial exceeds 256 KB inline cap; use blobs")
+        self._send({"t": "session_partial", "job_id": job_id, "data": data})
 
     def send_result(self, frame: dict) -> None:
-        # Blocking put is fine here: called only after the handler returns, so
-        # waiting cannot stall computation; FIFO orders it after all partials.
-        self._q.put(frame)
+        # Same lock/sendall as partials: FIFO orders the result after all
+        # partials for the job. OSError propagates (the session is dying).
+        self._send(frame)
 
     def close(self) -> None:
-        self._q.put(None)
-        self._thread.join(timeout=5)
+        pass
 
 
 def _read_line(rfile) -> bytes | None:

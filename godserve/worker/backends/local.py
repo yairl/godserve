@@ -21,7 +21,7 @@ from pathlib import Path
 from ...models import BlobRef, JobBundle
 from ..content import download, materialize
 from ..envs.venv import VenvProvider
-from ..session import SessionManager
+from ..session import SessionManager, _LOG_READ_LIMIT, _read_log_lines
 from .base import JobIO, JobOutcome
 
 log = logging.getLogger(__name__)
@@ -96,14 +96,12 @@ class LocalBackend:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,  # own process group → kill the whole tree
+            limit=_LOG_READ_LIMIT,
         )
 
         async def pump(reader, stream_name: str) -> None:
-            while True:
-                line = await reader.readline()
-                if not line:
-                    break
-                io.emit_log(stream_name, line.decode("utf-8", "replace"))
+            async for chunk in _read_log_lines(reader):
+                await io.emit_log(stream_name, chunk.decode("utf-8", "replace"))
 
         pumps = [
             asyncio.create_task(pump(proc.stdout, "stdout")),

@@ -47,7 +47,7 @@ the architecture analysis for those.
 2. Which existing seam absorbs it — LoadPolicy, EnvProvider, Backend, a
    protocol frame? Prefer extending a seam over adding a component.
 3. What is the minimal design that solves it without violating a CLAUDE.md
-   invariant (opacity, 256 KB cap, non-blocking streaming, atomic claim,
+   invariant (opacity, 256 KB cap, lossless ordered streaming, atomic claim,
    deferred-stays-deferred)?
 4. Is it buildable and verifiable within the current PLAN.md phase, with an
    acceptance criterion?
@@ -78,7 +78,7 @@ Required Changes:
 
 Interfaces Affected: [protocol frames / Backend / EnvProvider / LoadPolicy / db.py — or NONE]
 
-Invariant Check: [opacity / 256KB / non-blocking / atomic claim / deferred — each OK or flagged]
+Invariant Check: [opacity / 256KB / lossless streaming / atomic claim / deferred — each OK or flagged]
 
 Complexity Assessment: LOW | MEDIUM | HIGH
 

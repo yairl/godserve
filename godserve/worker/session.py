@@ -41,6 +41,15 @@ log = logging.getLogger(__name__)
 
 _IDLE_TICK_S = 3.0
 
+# fd-3 frames can carry a ~256 KB partial (post-JSON, plus envelope); size the
+# reader well above that. StreamReader pauses the transport at ~2× limit, so
+# this bounds worker RAM buffering on fd 3 at ~512 MiB.
+FD3_READER_LIMIT = 256 * 1024 * 1024
+
+# stdout/stderr are log streams; cap a single readline buffer and chunk-split
+# any longer line rather than raising LimitOverrunError and killing the pump.
+_LOG_READ_LIMIT = 8 * 1024 * 1024
+
 
 def _max_live_sessions() -> int:
     try:
@@ -61,6 +70,32 @@ def _session_init_s() -> float:
         return float(os.environ.get("GODSERVE_SESSION_INIT_S", "300"))
     except ValueError:
         return 300.0
+
+
+async def _read_log_lines(reader: asyncio.StreamReader):
+    """Yield log lines, chunk-splitting any line longer than the reader limit.
+
+    A line over the StreamReader limit raises LimitOverrunError on readline;
+    we drain that line in bounded reads and yield each piece so an over-long
+    log line is split into multiple emit_log chunks rather than killing the
+    pump. Never drops."""
+    while True:
+        try:
+            line = await reader.readline()
+        except (asyncio.LimitOverrunError, ValueError):
+            # Buffer exceeds the limit before a newline: drain a bounded slice
+            # and yield it as a chunk; the loop resumes on the remainder.
+            try:
+                chunk = await reader.read(_LOG_READ_LIMIT)
+            except (asyncio.IncompleteReadError, ValueError):
+                break
+            if not chunk:
+                break
+            yield chunk
+            continue
+        if not line:
+            break
+        yield line
 
 
 class Session:
@@ -95,13 +130,10 @@ class Session:
         ]
 
     async def _pump(self, reader: asyncio.StreamReader, stream_name: str) -> None:
-        while True:
-            line = await reader.readline()
-            if not line:
-                break
+        async for chunk in _read_log_lines(reader):
             io = self._io
             if io is not None:
-                io.emit_log(stream_name, line.decode("utf-8", "replace"))
+                await io.emit_log(stream_name, chunk.decode("utf-8", "replace"))
 
     async def await_ready(self, timeout_s: float) -> None:
         raw = await asyncio.wait_for(self._reader.readline(), timeout=timeout_s)
@@ -126,6 +158,14 @@ class Session:
             self._dead()
             await self.close()
             return JobOutcome(status="failed", error="timeout")
+        except asyncio.CancelledError:
+            # With blocking emit, a canceled job's handler can block forever in
+            # sendall once buffers fill. Closing the fd-3 transport gives the
+            # child EPIPE so its sendall raises and it exits (5s proc.wait +
+            # _kill_group fallback bounds it). Re-raise so cancel propagates.
+            self._dead()
+            await self.close()
+            raise
         except (OSError, RuntimeError) as exc:
             # Session died mid-job (fd-3 EOF / process exit): a partial worker
             # failure. Requeue via lease lapse rather than a terminal failure.
@@ -144,7 +184,7 @@ class Session:
                 raise RuntimeError("session closed fd 3 mid-job")
             frame = parse_frame(raw)
             if isinstance(frame, SessionPartial):
-                io.emit_partial(frame.data)
+                await io.emit_partial(frame.data)
             elif isinstance(frame, SessionResult):
                 if frame.error is not None:
                     return JobOutcome(status="failed", error=frame.error)
@@ -297,6 +337,7 @@ class SessionManager:
             start_new_session=True,
             pass_fds=(child_sock.fileno(), 3),
             preexec_fn=_preexec,
+            limit=_LOG_READ_LIMIT,
         )
         child_sock.close()  # parent drops its copy
         parent_sock.setblocking(False)
@@ -319,7 +360,7 @@ class SessionManager:
         # through the StreamWriter and close() closes the transport (never the
         # raw socket, which the transport owns).
         loop = asyncio.get_event_loop()
-        reader = asyncio.StreamReader()
+        reader = asyncio.StreamReader(limit=FD3_READER_LIMIT)
         protocol = asyncio.StreamReaderProtocol(reader)
         transport, _ = await loop.connect_accepted_socket(lambda: protocol, sock)
         writer = asyncio.StreamWriter(transport, protocol, reader, loop)

@@ -24,25 +24,26 @@ class JobOutcome:
 class JobIO:
     """Streaming sink handed to a backend; frames flow up the worker WS.
 
-    Emission is fire-and-forget — a slow reader upstream must never backpressure
-    the running handler (§4.2). The callbacks here schedule sends and return.
+    Emission is lossless and ordered — it awaits a bounded FIFO queue and may
+    block the running handler (backpressure) rather than dropping (§4.2). The
+    callbacks here enqueue sends and return once accepted.
     """
 
     def __init__(
         self,
         job_id: str,
-        emit_log: Callable[[str, str, str], None],
-        emit_partial: Callable[[str, str], None],
+        emit_log: Callable[[str, str, str], Awaitable[None]],
+        emit_partial: Callable[[str, str], Awaitable[None]],
     ):
         self.job_id = job_id
         self._emit_log = emit_log
         self._emit_partial = emit_partial
 
-    def emit_log(self, stream: str, data: str) -> None:
-        self._emit_log(self.job_id, stream, data)
+    async def emit_log(self, stream: str, data: str) -> None:
+        await self._emit_log(self.job_id, stream, data)
 
-    def emit_partial(self, data: str) -> None:
-        self._emit_partial(self.job_id, data)
+    async def emit_partial(self, data: str) -> None:
+        await self._emit_partial(self.job_id, data)
 
 
 class Backend(Protocol):

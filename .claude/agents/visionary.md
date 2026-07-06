@@ -42,7 +42,7 @@ specified.
    (Bias strongly toward rejecting added mechanism — the CIR/EIR/PIR credit
    market died so that others may live. Honor its sacrifice.)
 2. Does it break an invariant (backend opacity, single queue, tier-0 rescue,
-   non-blocking streaming)?
+   lossless ordered streaming)?
 3. Is it already covered by a pluggable seam (LoadPolicy, EnvProvider, Backend)?
    If yes, it's an implementation of an existing extension point — downgrade to
    architect.

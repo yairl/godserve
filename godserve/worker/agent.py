@@ -73,12 +73,11 @@ class Agent:
         self._backend = _make_backend(self._provider, str(self._work_root / "scratch"))
 
         self._ws: websockets.WebSocketClientProtocol | None = None
-        self._send_lock = asyncio.Lock()
         self._slots: dict[str, asyncio.Task] = {}
-        self._emits: set[asyncio.Task] = set()
-        # Emit tasks grouped by job_id so the terminal boundary can flush a
-        # job's outstanding partials/logs before its Result (see _run_job).
-        self._job_emits: dict[str, set[asyncio.Task]] = {}
+        # Single bounded FIFO of outbound frames (agent lifetime — frames survive
+        # reconnect). One sender task per connection drains it to ws.send, giving
+        # end-to-end ordered lossless streaming: emit awaits `put` (backpressure).
+        self._out: asyncio.Queue = asyncio.Queue(maxsize=1024)
         self._stopping = asyncio.Event()
         self._drain = False
 
@@ -108,25 +107,30 @@ class Agent:
             backoff = min(backoff * 2, 10.0)
 
     async def _session(self, ws) -> None:
-        await self._send(Hello(
+        # Hello goes directly on the ws BEFORE the sender starts, so any frames
+        # already queued (from a prior connection) can't precede Hello.
+        await ws.send(Hello(
             worker_id=self._worker_id,
             tier=self._tier,
             max_slots=self._max_slots,
             warm_envs=self.warm_envs(),
             live_sessions=self._backend.live_sessions(),
-        ))
-        await self._send_ready()
+        ).dump())
+        sender = asyncio.create_task(self._sender_loop(ws))
         hb = asyncio.create_task(self._heartbeat_loop())
+        await self._send_ready()
         try:
             async for raw in ws:
                 frame = parse_frame(raw if isinstance(raw, (bytes, str)) else bytes(raw))
                 await self._on_frame(frame)
         finally:
             hb.cancel()
-            try:
-                await hb
-            except asyncio.CancelledError:
-                pass
+            sender.cancel()
+            for task in (hb, sender):
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
 
     async def _on_frame(self, frame) -> None:
         if isinstance(frame, Assign):
@@ -166,15 +170,9 @@ class Agent:
             # lapses and the coordinator's sweeper requeues (ARCH §4.2). All job
             # state transitions still flow through claim/finish/requeue_expired.
             log.warning("job %s session crashed; leaving to lease requeue", bundle.job_id)
-            self._job_emits.pop(bundle.job_id, None)
         else:
-            # Terminal boundary: flush this job's outstanding partial/log sends
-            # so none can land on the coordinator after the Result (which
-            # finalizes the job and closes stream subscribers). Handler-time
-            # emission stays fire-and-forget — only this boundary is ordered.
-            pending = self._job_emits.pop(bundle.job_id, None)
-            if pending:
-                await asyncio.gather(*pending, return_exceptions=True)
+            # FIFO on the single outbound queue guarantees this Result lands
+            # after every partial/log for the job — no terminal flush needed.
             await self._send(Result(
                 job_id=bundle.job_id,
                 status=outcome.status,
@@ -186,29 +184,11 @@ class Agent:
         if not self._drain:
             await self._send_ready()
 
-    def _emit_log(self, job_id: str, stream: str, data: str) -> None:
-        # Fire-and-forget: scheduling a send must never block the handler.
-        self._spawn_emit(job_id, self._send(Output(job_id=job_id, stream=stream, data=data)))
+    async def _emit_log(self, job_id: str, stream: str, data: str) -> None:
+        await self._send(Output(job_id=job_id, stream=stream, data=data))
 
-    def _emit_partial(self, job_id: str, data: str) -> None:
-        self._spawn_emit(job_id, self._send(Partial(job_id=job_id, data=data)))
-
-    def _spawn_emit(self, job_id: str, coro) -> None:
-        # Retain a strong ref so the loop can't GC the task mid-flight and
-        # silently drop the send; discard on completion. Also group by job_id so
-        # the terminal boundary in _run_job can await this job's sends.
-        task = asyncio.create_task(coro)
-        self._emits.add(task)
-        group = self._job_emits.setdefault(job_id, set())
-        group.add(task)
-
-        def _done(t: asyncio.Task, jid: str = job_id) -> None:
-            self._emits.discard(t)
-            g = self._job_emits.get(jid)
-            if g is not None:
-                g.discard(t)
-
-        task.add_done_callback(_done)
+    async def _emit_partial(self, job_id: str, data: str) -> None:
+        await self._send(Partial(job_id=job_id, data=data))
 
     async def _send_ready(self) -> None:
         if self.free_slots() > 0:
@@ -222,24 +202,41 @@ class Agent:
         interval = max(DEFAULT_LEASE_TTL_S / 3, 1)
         while True:
             await asyncio.sleep(interval)
+            # Never block: a full queue means frames are already flowing (which
+            # renews the lease via those sends). A queue stuck behind a giant
+            # Result can still expire the lease — the accepted failure mode.
             try:
-                await self._send(Heartbeat(running=list(self._slots.keys())))
-            except Exception:
-                return
+                self._out.put_nowait(Heartbeat(running=list(self._slots.keys())))
+            except asyncio.QueueFull:
+                pass
 
-    async def _send(self, frame) -> None:
-        ws = self._ws
-        if ws is None:
-            return
-        async with self._send_lock:
+    async def _sender_loop(self, ws) -> None:
+        # The ONLY caller of ws.send after Hello. Drains the FIFO in order so
+        # streaming stays lossless and ordered; cancelled in _session's finally.
+        while True:
+            frame = await self._out.get()
             try:
                 await ws.send(frame.dump())
             except Exception as exc:
                 log.debug("send failed: %s", exc)
+                return
+
+    async def _send(self, frame) -> None:
+        # Backpressure: block the caller (handler emit / terminal Result) until
+        # the frame is accepted into the bounded FIFO. The sender task drains it.
+        await self._out.put(frame)
+
+    def _try_send(self, frame) -> None:
+        # Teardown frames (Goodbye) must never block: if the sender is gone or
+        # the queue is full, drop rather than hang the stop/drain path.
+        try:
+            self._out.put_nowait(frame)
+        except asyncio.QueueFull:
+            pass
 
     async def _begin_drain(self) -> None:
         self._drain = True
-        await self._send(Goodbye(drain=True))
+        self._try_send(Goodbye(drain=True))
         if self._slots:
             await asyncio.gather(*self._slots.values(), return_exceptions=True)
         await self._shutdown_backend()
@@ -252,7 +249,7 @@ class Agent:
         if self._slots:
             await asyncio.gather(*self._slots.values(), return_exceptions=True)
         await self._shutdown_backend()
-        await self._send(Goodbye(drain=False))
+        self._try_send(Goodbye(drain=False))
 
     async def _shutdown_backend(self) -> None:
         try:

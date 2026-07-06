@@ -279,14 +279,21 @@ upstream as `output`.
   `init()` runs once (load model into GPU); `handler(inputs, ctx)` runs per
   job. The **serve shim is a single dependency-free module** the agent puts on
   `PYTHONPATH`, so jobs don't need godserve installed in their venv.
-- **Partial-result streaming (non-blocking by default)**: a handler may
+- **Partial-result streaming (end-to-end lossless, ordered)**: a handler may
   `ctx.emit(chunk)` — or be a generator yielding chunks — producing
   `{job_id, partial}` IPC frames relayed to `stream` subscribers alongside logs
-  and persisted for replay. Emission is **fire-and-forget through a bounded
-  async buffer**: a slow or absent client never blocks or backpressures the
-  handler — streaming never stops result processing. Chunks obey the 256 KB cap
-  (§4.6). The terminal `{job_id, result}` frame is unchanged (polling clients
-  see only the final result).
+  and persisted for replay. Emission is **lossless with backpressure**: a
+  blocking `sendall` on fd 3 → session read loop → a single bounded agent FIFO →
+  one WS sender task. A slow link may **block the handler** (this counts against
+  `timeout_s`); frames are never silently dropped. The coordinator **persists
+  each frame (commit) before publishing**, so emit order == persist order ==
+  delivery order; the internal pubsub tail stays drop-oldest (a wake-up channel
+  only) and stream clients gap-repair missing frames from the DB by `seq`.
+  Chunks obey the 256 KB cap as a **hard error at emission** — an oversized or
+  non-JSON partial raises in the handler (the session survives), big chunks go
+  via blobs (§4.6). The terminal `{job_id, result}` frame is unchanged and
+  **uncapped** (auto-spills to a blob above the cap; polling clients see only
+  the final result).
 - A live session **receives the next job iff `session_key` matches** — no
   respawn, no re-init, no model reload. Idle timeout ⇒ graceful exit (frees
   GPU). Crash mid-job ⇒ that job requeues; the session respawns on demand.
@@ -344,7 +351,9 @@ it. **256 KB at ~100 Mbps ≈ 20 ms — exactly the hot-path budget**; a 10 MB
 frame would stall ~1s and delay lease renewals. It also bounds SQLite row size
 and coordinator memory. Therefore:
 
-- `inputs` and `result` are capped at **256 KB inline** (configurable).
+- `inputs` and per-element stream chunks (partials/logs) are capped at
+  **256 KB inline** (configurable), enforced as a hard error at emission.
+  Terminal `result`s are **uncapped** and auto-spill to a blob above the cap.
 - Anything larger: `POST /v1/blobs` (coordinator-hosted, sha256-verified) or
   any external URL via `godserve-fetch` / `inputs.blob_ref`; workers download
   over HTTP into the machine-wide content cache (§4.1).

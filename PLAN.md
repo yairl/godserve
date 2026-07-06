@@ -119,8 +119,10 @@ Startup recovery: expire all stale leases → requeue (§5 restart note).
 - `coordinator/blobs.py` — content-addressed store on coordinator disk:
   write to temp, hash, rename to `blobs/{sha256}`; idempotent.
 - `coordinator/pubsub.py` — per-job in-memory fan-out with bounded per-
-  subscriber queues; **drop-oldest on overflow** (a slow stream client never
-  backpressures ingestion — same non-blocking rule as §4.2).
+  subscriber queues; **drop-oldest on overflow** — a wake-up channel only. It
+  does **not** compromise losslessness: every frame is persisted (commit) before
+  publish, so stream clients gap-repair dropped frames from the DB by `seq`
+  (§4.2).
 - `coordinator/registry.py` — worker table (in-memory mirror + DB):
   register on `hello`, update on `ready`/`heartbeat`, mark `dead` on WS drop
   or heartbeat silence; background **sweeper task** (~1s) calls
@@ -215,13 +217,14 @@ def serve(handler, *, init=None):
     # open fd 3; ctx = Ctx(emit=..., job_id=..., scratch_dir=..., logger=...)
     # init() once → write SessionReady
     # loop: read SessionJob → out = handler(inputs, ctx)
-    #   generator handler → each yielded chunk = SessionPartial (fire-and-forget
-    #   through a bounded queue + writer thread; drop-oldest when full — never
-    #   blocks handler); final/returned value = SessionResult
+    #   generator handler → each yielded chunk = SessionPartial (blocking
+    #   sendall on fd 3 under a lock — lossless backpressure, never dropped; an
+    #   oversized/non-JSON chunk raises → job fails, session survives); final/
+    #   returned value = SessionResult
     #   exception → SessionResult{error} (session survives; traceback to stderr)
 ```
 
-`ctx.emit(chunk)` goes through the same bounded non-blocking buffer (§4.2).
+`ctx.emit(chunk)` uses the same lossless blocking write on fd 3 (§4.2).
 
 ### 2.2 `worker/session.py` — session manager
 

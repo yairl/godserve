@@ -37,15 +37,17 @@ pride and let the others hold their meetings.
   raw exceptions/tracebacks to clients.
 - Keep functions focused and reasonably sized.
 - Function signatures have no defaults unless explicitly requested.
-- Default to no comments; comment only non-obvious WHY (e.g. why drop-oldest,
-  why `O_EXCL`).
+- Default to no comments; comment only non-obvious WHY (e.g. why blocking
+  backpressure, why `O_EXCL`).
 
 ### Safety checks
 
 - Add try/except and validation only where genuinely needed.
 - Validate at system boundaries (HTTP bodies, WS frames from workers, session
   IPC frames, downloaded content hashes); trust internal code paths.
-- Enforce the 256 KB inline cap at ingestion points, not scattered downstream.
+- Enforce the 256 KB inline cap on `inputs`/partials at ingestion/emission as a
+  hard error (oversized/non-JSON partials raise; session survives). Terminal
+  results are uncapped and auto-spill to blobs.
 
 ### Simplicity
 

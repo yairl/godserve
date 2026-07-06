@@ -91,7 +91,7 @@ async def _status(args) -> int:
 def _coordinator(args) -> int:
     import uvicorn
 
-    from .coordinator.app import create_app
+    from .coordinator.app import WS_MAX_SIZE, create_app
     from .models import LevelConfig
 
     cfg = {}
@@ -101,7 +101,13 @@ def _coordinator(args) -> int:
     blob_root = cfg.get("blob_root", args.blob_root or "godserve-data")
     levels = [LevelConfig(**lvl) for lvl in (cfg.get("levels") or [])]
     app = create_app(db_path, blob_root, levels)
-    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+    uvicorn.run(
+        app,
+        host=args.host,
+        port=args.port,
+        log_level="info",
+        ws_max_size=WS_MAX_SIZE,
+    )
     return 0
 
 

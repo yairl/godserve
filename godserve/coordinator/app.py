@@ -45,6 +45,9 @@ log = logging.getLogger(__name__)
 DEFAULT_LEASE_TTL_S = 30
 # Default per-upload cap when GODSERVE_BLOB_MAX_BYTES is unset (1 GiB).
 DEFAULT_BLOB_MAX_BYTES = 1024 * 1024 * 1024
+# Worker-WS frame ceiling (1 GiB): a terminal result may reach ~100 MB before
+# blob-spill, so the ws server must not reject it at uvicorn's 16 MB default.
+WS_MAX_SIZE = 1024 * 1024 * 1024
 
 
 class BlobConfig:
@@ -225,10 +228,34 @@ def _register_routes(app: FastAPI) -> None:
         return {"job_id": job_id, "state": "canceling"}
 
     @app.websocket("/v1/jobs/{job_id}/stream")
-    async def stream_job(ws: WebSocket, job_id: str):
+    async def stream_job(ws: WebSocket, job_id: str, from_seq: int = 0):
         await ws.accept()
         db: DB = app.state.db
         pubsub: PubSub = app.state.pubsub
+
+        # Persisted-before-published (dispatcher) makes the DB the source of
+        # truth; the pubsub tail is drop-oldest, so we gap-repair from the DB.
+        # last_seq is the highest seq already delivered to this client.
+        last_seq = from_seq - 1
+
+        async def _send_log_row(lrow) -> None:
+            nonlocal last_seq
+            await ws.send_json({
+                "t": "output" if lrow["stream"] in ("stdout", "stderr") else "partial",
+                "seq": lrow["seq"],
+                "stream": lrow["stream"],
+                "data": lrow["data"],
+            })
+            last_seq = lrow["seq"]
+
+        async def _backfill_to(upto_exclusive: int) -> None:
+            # Send any persisted rows with seq in (last_seq, upto_exclusive).
+            if upto_exclusive <= last_seq + 1:
+                return
+            for lrow in await db.read_logs(job_id, last_seq + 1):
+                if lrow["seq"] >= upto_exclusive:
+                    break
+                await _send_log_row(lrow)
 
         q = pubsub.subscribe(job_id)
         try:
@@ -237,27 +264,34 @@ def _register_routes(app: FastAPI) -> None:
                 await ws.send_json({"t": "error", "detail": "job not found"})
                 return
 
-            # Replay persisted logs from seq 0.
-            for lrow in await db.read_logs(job_id, 0):
-                await ws.send_json({
-                    "t": "output" if lrow["stream"] in ("stdout", "stderr") else "partial",
-                    "seq": lrow["seq"],
-                    "stream": lrow["stream"],
-                    "data": lrow["data"],
-                })
+            # Replay persisted logs from from_seq.
+            for lrow in await db.read_logs(job_id, from_seq):
+                await _send_log_row(lrow)
 
-            # If already terminal, send the result frame and close.
+            # If already terminal, backfill any gap then send the result frame.
             row = await db.get_job(job_id)
             if row["state"] in ("succeeded", "failed", "canceled"):
+                await _backfill_to(1 << 62)  # drain all persisted rows
                 await _send_terminal(ws, db, row)
                 return
 
-            # Live tail.
+            # Live tail. Frames already delivered (seq <= last_seq) are skipped —
+            # this also drops live frames that arrived during replay (dup fix).
             while True:
                 frame = await q.get()
-                await ws.send_json(frame)
                 if frame.get("t") == "result":
+                    await _backfill_to(1 << 62)  # deliver everything persisted first
+                    await ws.send_json(frame)
                     return
+                seq = frame.get("seq")
+                if seq is None or seq <= last_seq:
+                    continue
+                if seq > last_seq + 1:
+                    await _backfill_to(seq)  # repair the gap from the DB
+                if seq <= last_seq:
+                    continue  # backfill already delivered this seq
+                await ws.send_json(frame)
+                last_seq = seq
         except WebSocketDisconnect:
             pass
         except Exception as exc:

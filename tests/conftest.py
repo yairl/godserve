@@ -12,7 +12,7 @@ import pytest
 import pytest_asyncio
 import uvicorn
 
-from godserve.coordinator.app import create_app
+from godserve.coordinator.app import WS_MAX_SIZE, create_app
 from godserve.worker.agent import Agent
 
 
@@ -26,7 +26,9 @@ def _free_port() -> int:
 
 class RunningServer:
     def __init__(self, app, port: int):
-        self._config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning")
+        self._config = uvicorn.Config(
+            app, host="127.0.0.1", port=port, log_level="warning", ws_max_size=WS_MAX_SIZE
+        )
         self._server = uvicorn.Server(self._config)
         self.port = port
         self._task: asyncio.Task | None = None

@@ -271,7 +271,7 @@ async def test_hot_path_added_latency_under_20ms(client, make_worker):
     backend = w.agent._backend
     assert backend.live_sessions() == [spec.session_key], "session must be hot before measuring"
 
-    def _noop(*_a, **_k):
+    async def _noop(*_a, **_k):
         return None
 
     async def _one() -> float:
